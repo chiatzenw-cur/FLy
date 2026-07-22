@@ -8,8 +8,8 @@ cd "$SCRIPT_DIR"
 
 pip install -e . 2>&1 | tail -5
 
-DRAFT_MODEL="meta-llama/Llama-3.1-8B-Instruct"
-CONFIG_PATH="fly_config/FLy_Llama3_70b.json"
+DRAFT_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
+CONFIG_PATH="fly_config/FLy_Qwen25Coder_14b.json"
 
 fly --model hf \
     --model_args pretrained=${DRAFT_MODEL},config_path=${CONFIG_PATH} \
