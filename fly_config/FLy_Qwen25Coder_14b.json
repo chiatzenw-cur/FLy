@@ -3,7 +3,7 @@
   "use_sd": true,
   "temperature": 0.0,
   "dual_tok": false,
-  "spd_k": 15,
+  "spd_k": 20,
   "enable_fly": true,
   "win_len": 6,
   "entropy_thre": 0.3,

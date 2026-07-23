@@ -6,7 +6,7 @@ export HF_ALLOW_CODE_EVAL=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-pip install -e . 2>&1 | tail -5
+#pip install -e . 2>&1 | tail -5
 
 DRAFT_MODEL="Qwen/Qwen2.5-Coder-1.5B-Instruct"
 CONFIG_PATH="fly_config/FLy_Qwen25Coder_14b.json"
