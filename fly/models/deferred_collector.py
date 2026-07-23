@@ -41,6 +41,21 @@ def teacher_forced_response_logit_bounds(
     return start, start + response_length
 
 
+def resolve_aligned_vocab_size(
+    target_logits_vocab_size: int,
+    draft_logits_vocab_size: int,
+    tokenizer_vocab_size: int,
+) -> int:
+    sizes = (
+        int(target_logits_vocab_size),
+        int(draft_logits_vocab_size),
+        int(tokenizer_vocab_size),
+    )
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"vocabulary sizes must be positive, got {sizes}")
+    return min(sizes)
+
+
 def compute_position_features(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor,
@@ -162,10 +177,23 @@ def build_raw_mask_record(
     match_mask: Sequence[bool],
     position_features: Dict[str, Sequence[float]],
     max_future_window: int,
+    target_logits_vocab_size: int,
+    draft_logits_vocab_size: int,
+    tokenizer_vocab_size: int,
+    aligned_vocab_size: int,
 ) -> Dict:
     """Build one label-free record for one target-generated response."""
     if max_future_window <= 0:
         raise ValueError("max_future_window must be positive")
+    expected_aligned_vocab_size = min(
+        int(target_logits_vocab_size),
+        int(draft_logits_vocab_size),
+        int(tokenizer_vocab_size),
+    )
+    if aligned_vocab_size != expected_aligned_vocab_size:
+        raise ValueError(
+            "aligned_vocab_size must equal the shared tokenizer/model vocabulary"
+        )
 
     response_length = len(target_response_token_ids)
     aligned_fields = {
@@ -196,6 +224,10 @@ def build_raw_mask_record(
             ",".join(str(value) for value in normalized_prompt_ids).encode("utf-8")
         ).hexdigest(),
         "max_future_window": int(max_future_window),
+        "target_logits_vocab_size": int(target_logits_vocab_size),
+        "draft_logits_vocab_size": int(draft_logits_vocab_size),
+        "tokenizer_vocab_size": int(tokenizer_vocab_size),
+        "aligned_vocab_size": int(aligned_vocab_size),
         "prompt_length": len(normalized_prompt_ids),
         "response_length": response_length,
         "prompt_token_ids": normalized_prompt_ids,
@@ -222,6 +254,19 @@ def validate_raw_mask_record(record: Dict) -> None:
         raise ValueError("unexpected raw-mask schema version")
 
     response_length = int(record["response_length"])
+    target_vocab_size = int(record["target_logits_vocab_size"])
+    draft_vocab_size = int(record["draft_logits_vocab_size"])
+    tokenizer_vocab_size = int(record["tokenizer_vocab_size"])
+    aligned_vocab_size = int(record["aligned_vocab_size"])
+    if (
+        aligned_vocab_size <= 0
+        or aligned_vocab_size > target_vocab_size
+        or aligned_vocab_size > draft_vocab_size
+        or aligned_vocab_size > tokenizer_vocab_size
+        or aligned_vocab_size
+        != min(target_vocab_size, draft_vocab_size, tokenizer_vocab_size)
+    ):
+        raise ValueError("invalid aligned vocabulary metadata")
     if int(record["prompt_length"]) != len(record["prompt_token_ids"]):
         raise ValueError("prompt_length is inconsistent with prompt_token_ids")
     expected_prompt_hash = hashlib.sha256(

@@ -38,6 +38,7 @@ validate_raw_mask_record = deferred_collector.validate_raw_mask_record
 teacher_forced_response_logit_bounds = (
     deferred_collector.teacher_forced_response_logit_bounds
 )
+resolve_aligned_vocab_size = deferred_collector.resolve_aligned_vocab_size
 
 
 def _features(length):
@@ -59,6 +60,10 @@ class DeferredCollectorTests(unittest.TestCase):
             match_mask=[True, False, True, False],
             position_features=_features(4),
             max_future_window=64,
+            target_logits_vocab_size=16,
+            draft_logits_vocab_size=12,
+            tokenizer_vocab_size=10,
+            aligned_vocab_size=10,
         )
 
         self.assertEqual(record["schema_version"], RAW_MASK_SCHEMA_VERSION)
@@ -77,6 +82,10 @@ class DeferredCollectorTests(unittest.TestCase):
             match_mask=[True, False],
             position_features=_features(2),
             max_future_window=64,
+            target_logits_vocab_size=16,
+            draft_logits_vocab_size=12,
+            tokenizer_vocab_size=10,
+            aligned_vocab_size=10,
         )
         record["match_mask"][1] = True
 
@@ -116,6 +125,10 @@ class DeferredCollectorTests(unittest.TestCase):
             match_mask=[True],
             position_features=_features(1),
             max_future_window=64,
+            target_logits_vocab_size=16,
+            draft_logits_vocab_size=12,
+            tokenizer_vocab_size=10,
+            aligned_vocab_size=10,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -139,6 +152,10 @@ class DeferredCollectorTests(unittest.TestCase):
             match_mask=[True, False, True],
             position_features=_features(3),
             max_future_window=64,
+            target_logits_vocab_size=16,
+            draft_logits_vocab_size=12,
+            tokenizer_vocab_size=10,
+            aligned_vocab_size=10,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -154,6 +171,11 @@ class DeferredCollectorTests(unittest.TestCase):
         coverage = summary["future_window_coverage"]["64"]
         self.assertEqual(coverage["eligible"], 0)
         self.assertEqual(coverage["right_censored"], 1)
+
+    def test_resolve_aligned_vocab_size_uses_shared_tokenizer_prefix(self):
+        self.assertEqual(resolve_aligned_vocab_size(152064, 151936, 151665), 151665)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            resolve_aligned_vocab_size(10, 0, 8)
 
 
 if __name__ == "__main__":

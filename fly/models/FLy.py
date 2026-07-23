@@ -12,6 +12,7 @@ from fly.models.deferred_collector import (
     RawMaskJSONLWriter,
     build_raw_mask_record,
     compute_position_features,
+    resolve_aligned_vocab_size,
     teacher_forced_response_logit_bounds,
 )
 
@@ -922,6 +923,7 @@ class SPDGenerate:
 
         generation_kwargs = {
             "input_ids": target_input_ids,
+            "attention_mask": torch.ones_like(target_input_ids),
             "max_new_tokens": self.total_gen_tok,
             "pad_token_id": pad_token_id,
             "use_cache": True,
@@ -952,6 +954,7 @@ class SPDGenerate:
             )
             draft_outputs = self.draft_model(
                 input_ids=draft_teacher_forcing_ids,
+                attention_mask=torch.ones_like(draft_teacher_forcing_ids),
                 use_cache=False,
                 return_dict=True,
             )
@@ -968,19 +971,48 @@ class SPDGenerate:
                     "draft teacher-forced logits do not align with target response"
                 )
 
-            draft_top1_ids = draft_logits.argmax(dim=-1)
-            target_top1_ids = target_logits.argmax(dim=-1)
+            target_logits_vocab_size = target_logits.shape[-1]
+            draft_logits_vocab_size = draft_logits.shape[-1]
+            aligned_vocab_size = resolve_aligned_vocab_size(
+                target_logits_vocab_size,
+                draft_logits_vocab_size,
+                len(self.tokenizer),
+            )
+            if target_response_ids.max().item() >= aligned_vocab_size:
+                raise RuntimeError(
+                    "target generated a token outside the shared tokenizer vocabulary"
+                )
+            if target_logits_vocab_size != draft_logits_vocab_size:
+                self.cuslog.info(
+                    "Aligning unequal logits vocabularies for raw-mask features: "
+                    f"target={target_logits_vocab_size}, "
+                    f"draft={draft_logits_vocab_size}, "
+                    f"tokenizer={len(self.tokenizer)}, "
+                    f"aligned={aligned_vocab_size}"
+                )
+
+            target_logits_aligned = target_logits[..., :aligned_vocab_size]
+            draft_logits_aligned = draft_logits[..., :aligned_vocab_size]
+            draft_top1_ids = draft_logits_aligned.argmax(dim=-1)
+            target_top1_ids = target_logits_aligned.argmax(dim=-1)
             match_mask = draft_top1_ids.to(target_response_ids.device).eq(
                 target_response_ids
             )
 
             position_features = compute_position_features(
-                target_logits=target_logits,
-                draft_logits=draft_logits,
+                target_logits=target_logits_aligned,
+                draft_logits=draft_logits_aligned,
                 draft_token_ids=draft_top1_ids,
                 chunk_size=self.raw_mask_feature_chunk_size,
             )
         else:
+            target_logits_vocab_size = int(self.target_model.config.vocab_size)
+            draft_logits_vocab_size = int(self.draft_model.config.vocab_size)
+            aligned_vocab_size = resolve_aligned_vocab_size(
+                target_logits_vocab_size,
+                draft_logits_vocab_size,
+                len(self.tokenizer),
+            )
             draft_top1_ids = torch.empty(
                 (1, 0), dtype=torch.long, device=self.draft_model.device
             )
@@ -1013,6 +1045,10 @@ class SPDGenerate:
             match_mask=match_mask[0].detach().cpu().tolist(),
             position_features=position_features,
             max_future_window=self.raw_mask_max_future,
+            target_logits_vocab_size=target_logits_vocab_size,
+            draft_logits_vocab_size=draft_logits_vocab_size,
+            tokenizer_vocab_size=len(self.tokenizer),
+            aligned_vocab_size=aligned_vocab_size,
         )
         self.raw_mask_writer.write(record)
 
