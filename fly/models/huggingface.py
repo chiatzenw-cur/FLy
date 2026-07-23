@@ -114,6 +114,10 @@ class HFLM(TemplateLM):
         think_end_token: Union[str, int, None] = None,
         total_gen_tok=1024,
         enable_statistics: Optional[bool] = False,
+        collect_raw_mask: Optional[bool] = False,
+        raw_mask_output_path: Optional[str] = None,
+        raw_mask_max_future: int = 64,
+        raw_mask_feature_chunk_size: int = 8,
         config_path=None,
         **kwargs,
     ) -> None:
@@ -385,6 +389,11 @@ class HFLM(TemplateLM):
                 "branch_n":self.json_config.get("branch_n", 10),
                 "max_nodes_per_level":self.json_config.get("max_nodes_per_level", 10),
                 "max_nodes_global":self.json_config.get("max_nodes_global", 100),
+                "collect_raw_mask":collect_raw_mask,
+                "raw_mask_output_path":raw_mask_output_path,
+                "raw_mask_max_future":raw_mask_max_future,
+                "raw_mask_feature_chunk_size":raw_mask_feature_chunk_size,
+                "world_size":self._world_size,
             }
 
             if self.json_config['dual_tok']:
@@ -1082,7 +1091,11 @@ class HFLM(TemplateLM):
             dtype=self.mixed_precision_dtype,
             enabled=self.mixed_precision_dtype is not None,
         ):
-            accepted_token = self.spd_gen.generate_chunks(context, self.temperature)
+            accepted_token = self.spd_gen.generate_chunks(
+                context,
+                self.temperature,
+                stopping_criteria=stopping_criteria,
+            )
         _ = self.spd_gen.show_status()
         return accepted_token
 

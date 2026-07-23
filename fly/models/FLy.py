@@ -7,6 +7,14 @@ from typing import Optional, Dict, List, Tuple
 from functools import cached_property
 import os
 
+from fly.models.deferred_collector import (
+    POSITION_FEATURE_KEYS,
+    RawMaskJSONLWriter,
+    build_raw_mask_record,
+    compute_position_features,
+    teacher_forced_response_logit_bounds,
+)
+
 
 
 # torch.multinomial forces a GPU<->CPU sync.
@@ -109,6 +117,37 @@ class SPDGenerate:
         self.global_total_initial_mismatch = 0
         self.global_total_fly_accepted = 0
         self.global_sample_count = 0
+        self.global_raw_mask_positions = 0
+
+        self.collect_raw_mask = bool(spd_args.get("collect_raw_mask", False))
+        self.raw_mask_max_future = int(spd_args.get("raw_mask_max_future", 64))
+        self.raw_mask_feature_chunk_size = int(
+            spd_args.get("raw_mask_feature_chunk_size", 8)
+        )
+        self.raw_mask_sample_id = 0
+        self.raw_mask_writer = None
+
+        if self.collect_raw_mask:
+            if self.draft_tokenizer is not None:
+                raise ValueError(
+                    "raw-mask collection requires aligned target and draft tokenizers"
+                )
+            if int(spd_args.get("world_size", 1)) != 1:
+                raise ValueError(
+                    "raw-mask collection currently supports a single process only"
+                )
+            if self.raw_mask_max_future <= 0:
+                raise ValueError("raw_mask_max_future must be positive")
+            if self.raw_mask_feature_chunk_size <= 0:
+                raise ValueError("raw_mask_feature_chunk_size must be positive")
+            self.raw_mask_writer = RawMaskJSONLWriter(
+                spd_args.get("raw_mask_output_path")
+            )
+            self.cuslog.info(
+                "Raw-mask collector enabled: target generates first, draft is "
+                f"teacher-forced on the target response, max_future_window="
+                f"{self.raw_mask_max_future}, output={self.raw_mask_writer.path}"
+            )
 
 
 
@@ -864,7 +903,146 @@ class SPDGenerate:
 
 
     @torch.no_grad()
-    def generate_chunks(self, input_ids, temperature):
+    def _collect_target_teacher_forced(
+        self, input_ids, temperature, stopping_criteria=None
+    ):
+        if input_ids.shape[0] != 1:
+            raise ValueError("raw-mask collection supports batch size 1 only")
+        if float(temperature) != 0.0:
+            raise ValueError("raw-mask collection currently requires temperature=0")
+
+        self.reset_counter()
+        self.start_time = time.time()
+
+        prompt_length = input_ids.shape[1]
+        target_input_ids = input_ids.to(self.target_model.device)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        generation_kwargs = {
+            "input_ids": target_input_ids,
+            "max_new_tokens": self.total_gen_tok,
+            "pad_token_id": pad_token_id,
+            "use_cache": True,
+            "do_sample": False,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+        }
+        if stopping_criteria is not None:
+            generation_kwargs["stopping_criteria"] = stopping_criteria
+
+        target_generation = self.target_model.generate(**generation_kwargs)
+        target_sequences = target_generation.sequences
+        response_length = len(target_generation.scores)
+        target_response_ids = target_sequences[
+            :, prompt_length : prompt_length + response_length
+        ]
+
+        if target_response_ids.shape[1] != response_length:
+            raise RuntimeError(
+                "target generation scores do not align with generated response tokens"
+            )
+
+        if response_length:
+            target_logits = torch.stack(target_generation.scores, dim=1)
+
+            draft_teacher_forcing_ids = target_sequences[:, :-1].to(
+                self.draft_model.device
+            )
+            draft_outputs = self.draft_model(
+                input_ids=draft_teacher_forcing_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            response_logit_start, response_logit_end = (
+                teacher_forced_response_logit_bounds(
+                    prompt_length, response_length
+                )
+            )
+            draft_logits = draft_outputs.logits[
+                :, response_logit_start:response_logit_end, :
+            ]
+            if draft_logits.shape[1] != response_length:
+                raise RuntimeError(
+                    "draft teacher-forced logits do not align with target response"
+                )
+
+            draft_top1_ids = draft_logits.argmax(dim=-1)
+            target_top1_ids = target_logits.argmax(dim=-1)
+            match_mask = draft_top1_ids.to(target_response_ids.device).eq(
+                target_response_ids
+            )
+
+            position_features = compute_position_features(
+                target_logits=target_logits,
+                draft_logits=draft_logits,
+                draft_token_ids=draft_top1_ids,
+                chunk_size=self.raw_mask_feature_chunk_size,
+            )
+        else:
+            draft_top1_ids = torch.empty(
+                (1, 0), dtype=torch.long, device=self.draft_model.device
+            )
+            target_top1_ids = torch.empty(
+                (1, 0), dtype=torch.long, device=self.target_model.device
+            )
+            match_mask = torch.empty(
+                (1, 0), dtype=torch.bool, device=self.target_model.device
+            )
+            position_features = {key: [] for key in POSITION_FEATURE_KEYS}
+
+        target_top1_matches_response = target_top1_ids.to(
+            target_response_ids.device
+        ).eq(target_response_ids)
+        if response_length and not target_top1_matches_response.all():
+            self.cuslog.warning(
+                "Some generated target tokens differ from argmax(output_scores). "
+                "The raw match mask is defined against the actual generated response."
+            )
+
+        record = build_raw_mask_record(
+            sample_id=self.raw_mask_sample_id,
+            prompt_token_ids=input_ids[0].detach().cpu().tolist(),
+            target_response_token_ids=target_response_ids[0]
+            .detach()
+            .cpu()
+            .tolist(),
+            draft_top1_token_ids=draft_top1_ids[0].detach().cpu().tolist(),
+            target_top1_token_ids=target_top1_ids[0].detach().cpu().tolist(),
+            match_mask=match_mask[0].detach().cpu().tolist(),
+            position_features=position_features,
+            max_future_window=self.raw_mask_max_future,
+        )
+        self.raw_mask_writer.write(record)
+
+        counter_device = self.draft_model.device
+        num_matches = int(match_mask.sum().item())
+        self.num_accepted_tokens = torch.tensor(
+            num_matches, dtype=torch.long, device=counter_device
+        )
+        self.num_emitted_tokens = torch.tensor(
+            response_length, dtype=torch.long, device=counter_device
+        )
+        self.num_draft_round = torch.ones(
+            (), dtype=torch.long, device=counter_device
+        )
+        self._counter_inited = True
+        self.total_initial_mismatch = response_length - num_matches
+        self.total_fly_accepted = 0
+        self.raw_mask_last_sample_id = self.raw_mask_sample_id
+        self.raw_mask_sample_id += 1
+        self.end_time = time.time()
+
+        return target_sequences.to(input_ids.device)
+
+    @torch.no_grad()
+    def generate_chunks(self, input_ids, temperature, stopping_criteria=None):
+        if self.collect_raw_mask:
+            return self._collect_target_teacher_forced(
+                input_ids, temperature, stopping_criteria=stopping_criteria
+            )
+
         init_len = input_ids.shape[1]
         self.reset_counter()
 
@@ -1188,6 +1366,37 @@ class SPDGenerate:
     def show_status(self):
         elapsed = self.end_time - self.start_time
 
+        if self.collect_raw_mask:
+            positions = self.num_emitted_tokens.item()
+            matches = self.num_accepted_tokens.item()
+            mismatches = positions - matches
+            mismatch_rate = mismatches / positions if positions else 0.0
+            speed = positions / elapsed if elapsed > 0 else 0.0
+            self.cuslog.info(
+                f"RawMaskSample:{self.raw_mask_last_sample_id}"
+                f"|Positions:{positions}"
+                f"|Mismatches:{mismatches}"
+                f"|MismatchRate:{mismatch_rate:.2%}"
+                f"|Elapsed:{elapsed:.2f}"
+                f"|PositionsPerSecond:{speed:.2f}"
+            )
+
+            if self.enable_statistics:
+                self.global_raw_mask_positions += positions
+                self.global_total_initial_mismatch += mismatches
+                self.global_sample_count += 1
+
+            return {
+                "accepted": self.num_accepted_tokens,
+                "emitted": self.num_emitted_tokens,
+                "draft_round": self.num_draft_round,
+                "elapsed": elapsed,
+                "initial_mismatch": mismatches,
+                "fly_accepted": 0,
+                "final_rejected": mismatches,
+                "fly_accept_rate": 0.0,
+            }
+
         cur_speed = self.num_emitted_tokens.item() / elapsed
         self.speed_list.append(cur_speed)
         speed = sum(self.speed_list) / len(self.speed_list)
@@ -1268,6 +1477,26 @@ class SPDGenerate:
     
     def print_global_statistics(self):
         if not self.enable_statistics:
+            return
+
+        if self.collect_raw_mask:
+            mismatch_rate = (
+                self.global_total_initial_mismatch / self.global_raw_mask_positions
+                if self.global_raw_mask_positions
+                else 0.0
+            )
+            self.cuslog.info("=" * 80)
+            self.cuslog.info("Raw Mask Collector Statistics")
+            self.cuslog.info("=" * 80)
+            self.cuslog.info(f"Total Samples: {self.global_sample_count}")
+            self.cuslog.info(
+                f"Total Response Positions: {self.global_raw_mask_positions}"
+            )
+            self.cuslog.info(
+                f"Total Mismatches: {self.global_total_initial_mismatch}"
+            )
+            self.cuslog.info(f"Mismatch Rate: {mismatch_rate:.2%}")
+            self.cuslog.info("=" * 80)
             return
         
         stats = self.get_global_statistics()
